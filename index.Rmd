@@ -1,0 +1,547 @@
+---
+title: "Final Project"
+author: "Daniel Turner"
+date: "May 18, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(leaflet)
+library(lubridate)
+library(stringr)
+library(tree)
+library(neuralnet)
+library(class)
+library(pracma)
+```
+
+# Montgomery County Traffic Violations
+
+Driving is an integral part of life for millions of Americans. One unfortunate part of driving is getting hit with traffic violations (speeding, parking tickets, etc.). We all do our best to avoid them, but given how frequently we drive, most people have slipped up at least once and have an infraction or two on their record. I'd like to do some analysis on Montgomery County traffic violations to gain some insight into how and when traffic infractions are given. These insights will be useful: we may be able to build statistical models that predict whether or not we get an infraction based on our driving habits.
+
+We'll be using a dataset (available on [kaggle](https://www.kaggle.com/rounak041993/traffic-violations-in-maryland-county)) of traffic violations in Montgomery County (the dataset on Kaggle is named "Traffic violations in Maryland County," but the dataset that this page links to is from [government data](https://catalog.data.gov/dataset/traffic-violations-56dda) on Montgomery County). This tutorial will walk you through the basics of data ingestion, manipulation and analysis. Then we'll do some machine learning with different classifiers, and we'll determine which classifier performs better on the data. Although we're performing analysis on a specific dataset, the techniques and code in this tutorial will be generally applicable to a wide range of data sets.
+
+Here's a rough outline of this tutorial:
+
+* Loading the data into R
+* Cleaning up the data
+* Extracting more information (I recommend you skip ahead to this section if you're already familiar with the basics of loading and tidying data in R)
+* Data Analysis
+* Machine Learning
+
+## Loading the data into R
+
+The first thing we want to do is load our dataset into a dataframe, which is R's notion of a table. Once the data is in a dataframe, we can perform our analysis. Sometimes, getting data into a dataframe can be tough - data may have to be scraped from a webpage (which involves parsing HTML that may or may not be consistently formatted) or taken from an API and coerced into a table. Fortunately, our dataset is in CSV (Comma-Separated Value) format, which is tabular and very easy to load into a dataframe. We can do that with the read_csv function like so:
+
+```{r loadDataFrame}
+tv <- read_csv('/Users/Daniel/Documents/UMD/CMSC320/finalproj/dcturner45.github.io/Traffic_Violations.csv')
+tv
+```
+
+The output above tells us we have ~1.3 million rows that each have 35 attributes, which is a lot of data! Let's see what kind of attributes we have to look at. We can do this with the `spec` function, which lists all of the table's attributes along with their data types that R has inferred for us.
+
+```{r spec}
+spec(tv)
+```
+
+Most of the data appears to be strings (indicated by `col_character()`), with a few integer and floating-point attributes. This data is decently formatted, but we'll definitely want to clean it up a bit. 
+
+## Cleaning up the data
+
+The first thing we can fix on this table is the fact that the `Date Of Stop` column didn't properly infer its values as having type `date.` Let's fix that:
+
+```{r fixDate}
+tv$`Date Of Stop` <- as.Date(tv$`Date Of Stop`, "%m/%d/%Y")
+```
+
+The next thing I'd like to fix is the spaces in some of the column names. While this isn't a big issue, it makes writing analysis code a little bit easier (column names that have spaces have to be wrapped in \`backticks\`, which can be annoying when typing lots of column names). We'll do this with the `gsub` function, which uses a regex, or a regular expression (more on that [here](https://en.wikipedia.org/wiki/Regular_expression) and [here](https://ryanstutorials.net/regular-expressions-tutorial/)), to replace portions of a string with another string.
+
+```{r removeSpaces}
+colnames(tv) <- gsub(' ', '', colnames(tv)) # Replace all instances of ' ' with '' in each column name
+```
+
+Next, it seems that some attributes that would naturally lend themselves to true/false values (e.g., `Accident`, `Belts`, `Fatal`, etc.) have been encoded in the table as "Yes" or "No." Let's convert these to Booelan-valued attributes, which are a bit easier to perform operations on. Instead of doing this column by column, we can iterate over each column and examine its possible values - if the only possible values are "Yes" and "No", we'll convert that column to boolean values of true ("Yes") and false ("No").
+
+```{r convertToBoolean}
+for (columnName in colnames(tv)) {
+  
+  # Get the first non-NA value from this column
+  firstNonMissingValue <- NA
+  idx <- 1
+  while (idx <= nrow(tv) && is.na(firstNonMissingValue)) {
+    firstNonMissingValue <- tv[columnName][[1]][[idx]]
+    idx <- idx + 1
+  }
+  
+  # If every value is yes or no, convert yes -> TRUE and no -> FALSE
+  if (firstNonMissingValue %in% c('Yes', 'No')) {
+    uniqueValues <- unique(tv[columnName]) # List of all possible attribute values for this column
+    if ( (length(uniqueValues[[1]]) == 2)
+         && ('Yes' %in% uniqueValues[[1]]) 
+         && ('No' %in% uniqueValues[[1]]) ) {
+      tv[columnName] <- tv[columnName] == 'Yes'
+    }
+  }
+}
+```
+
+## Extracting More Information
+
+There's some useful data sitting inside the `Description` column. Specifically, there is numeric data on speed traveled and the posted speed limit for speeding infractions. 
+
+Taking a look at the dataset, it looks like the entries that have the data we need appear to be of the format "EXCEEDING MAXIMUM SPEED: \<traveling speed\> MPH IN A POSTED \<posted speed\> MPH ZONE." Because we can't be sure that all of these are formatted perfectly consistently, we'll consider any row which has "SPEED" and exactly two separate numbers to be of interest. The larger number will be the traveling speed, and the smaller number will be the posted speed limit (otherwise, no infraction would have been issued). We'll use regular expressions to take care of this.
+
+The pipeline for extracting the two speeds is a bit complex. Its basic outline is as follows:
+
+1. For each `Description` entry, extract any numbers in it to a `Speeds` column (this involves using `gsub` and `paste`, after which the resulting values need to be cleansed of extraneous characters added by `paste`)
+2. Remove any entries where the number of speeds != 2 (done by checking that the number of spaces in `Speeds` == 1)
+3. Separate each speed in `Strings` to two string columns `s1` and `s2`, then convert these columns to numeric
+4. Set the max of `s1` and `s2` to the traveling speed and the min to the posted speed limit
+5. Create a `Diff` column that contains the difference of the two speeds.
+
+This pipeline will also convert the ViolationType to a [factor](https://www.stat.berkeley.edu/classes/s133/factors.html), R's datatype for categorical variables.
+
+```{r extractSpeeds}
+
+# See above for a description of pipeline
+tvWithExtractions <- tv %>%
+  filter(grepl('SPEED', Description)) %>%
+  mutate(Speeds=gsub('c|\\(|\\)|\\\"|,', 
+                     '', 
+                     str_extract_all(Description, '\\d+') %>% paste(sep=''))) %>%
+  filter(str_count(`Speeds`, ' ') == 1) %>%
+  separate(Speeds, into=c('s1', 's2')) %>%
+  mutate(s1=as.numeric(s1), 
+         s2=as.numeric(s2)) %>%
+  mutate(PostedSpeedLimit=pmin(s1, s2),
+         TravelingSpeed=pmax(s1, s2),
+         ViolationType = factor(ifelse(ViolationType == 'Citation', 'Citation', 'Warning'))) %>%
+  mutate(Diff = TravelingSpeed - PostedSpeedLimit) %>% 
+  # Remove any impossibly large speed differences or 0mph speed limits (exist due to poorly formatted data)
+  filter(Diff < 500 & PostedSpeedLimit > 0) %>% 
+  select(-s1, -s2) # Remove temporary computation columns
+
+tv <- tvWithExtractions
+```
+
+Finally, let's get rid of the columns that we don't need. This will make it easier to focus on the data that we're analyzing. The columns that won't be relevant to our analysis are:
+
+* Agency
+* SubAgency
+* Location (The Latitude/Longitude columns contain more accurate and consistently formatted location information)
+* HAZMAT
+* Race
+* Gender
+* Geolocation (this information is already in a nicer format in the Latitude and Longitude columns)
+
+We can remove these columns like so:
+
+```{r removeColumns}
+# The '-' sign in front of each column indicates that we want select() to remove that column
+tv <- tv %>% select(-Agency, -SubAgency, -Location, -HAZMAT, -Race, -Gender, -Geolocation)
+tv
+```
+
+This is a good starting point for analysis. Once we start asking specific questions, we can modify the table further to meet our needs for a given question if we need to do so.
+
+## Data Analysis
+
+Let's look at the correlation between mph traveled over the speed limit (referred to from here on out as speed difference or diff) and what type of violation (warning vs. citation) was issued. It would make sense that the chances of getting a citation increase along with how far over the speed limit one is. Let's do some analysis and use statistics to find out if it's the case. We'll group our data up by citation type and create a [boxplot](http://www.physics.csbsju.edu/stats/box2.html) of the speeds for each of the type.
+
+```{r speedboxplot}
+tv %>% 
+  ggplot(aes(y=Diff, x=ViolationType)) +
+  labs(title='Amount Traveled Over Speed Limit vs. Citation Type Issued',
+       y='Amount Traveled Over Speed Limit',
+       x='Citation Type Issued') +
+  geom_boxplot()
+```
+
+Interestingly, the center (median) of the speeds for Warning is actually higher than the median of the speeds for Citation. However, there is a high frequency of high outliers for Citation. Each plot appears to have an odd spread: there is a high concentration of data near the median within the IQR, and another high concentration of outliers above Q3. Warning's spread appears to be smaller than Citation's, as it has a smaller IQR. We have other measures of center and spread: the mean and the standard deviation. These can be caluclated like so:
+
+```{r calcMeanSD}
+citationTbl <- tv %>% filter(ViolationType=='Citation')
+warningTbl <- tv %>% filter(ViolationType=='Warning')
+
+citationMean <- mean(citationTbl$Diff)
+citationSD <- sd(citationTbl$Diff)
+warningMean <- mean(warningTbl$Diff)
+warningSD <- sd(warningTbl$Diff)
+
+# Construct a table to nicely display our statistics
+citationRow <- c('Citation', citationMean, citationSD)
+warningRow <- c('Warning', warningMean, warningSD)
+
+statsTbl <- rbind(citationRow, warningRow) %>% 
+  as_tibble()
+colnames(statsTbl) <- c('ViolationType', 'AverageSpeedDiff', 'SpeedDiffSD')
+
+statsTbl
+```
+
+The means here tell us similar things about the center of the data: Warning infractions have a higher average amount being traveled above the speed limit. The standard deviation here puts into a single number what we surmised from the graph above: Warning's spread for the speed difference is in fact smaller than Citation's. 
+
+We'll use further statistical analysis to see if there is any correlation between speed difference and violation type. We can do this by fitting a [regression](http://www.hcbravo.org/IntroDataSci/bookdown-notes/linear-models-for-classification.html#logistic-regression) model and looking at the results of a [t-test](http://www.statisticshowto.com/probability-and-statistics/t-test/). Our null hypothesis for this test is that there is no significant difference in the distributions of speed differences for citations vs. warnings. 
+
+```{r dotest}
+diffModel <- lm(Diff~ViolationType, data=tv)
+summary(diffModel)
+```
+Indeed, this test tells us that people given warnings were traveling on average ~3.9 mph faster than people given citations. A p-value of <2e-16, well below .05, tells us that we can reject the null hypothesis of no significant difference and that our results are statistically significant. But this can't be right! How could one be more likely to get a warning over a citation by traveling further above the speed limit? 
+
+In this case, it appears it's necessary to examine the relationship between violation type and some other variables in addition to speed difference. We can do that with machine learning models, as you'll see in the next section.
+
+## Machine Learning
+
+The analyses above were a nice intro to some simple plotting and hypothesis testing, but they clearly don't show the full picture. In this section, we will use two powerful tools: **K nearest neighbors** and a **decision tree**. These tools are known as classifiers because they take in a training example in the form of an input vector and output a *classification*, or label. The t-test from above only examined the relationship between violation type and speed difference; these classifiers will let us examine the relationship between violation type and multiple variables.
+
+A classifier is trained on a set of input data and learns classifications for each input example. It then produces predicted classifications for a set of testing data. The performance of the classifier is measured by the amount of correct predicted classifications from the testing data. Once the classifier is trained and tested, it can be used to generate a classification for an input vector that it wasn't trained on. We will train and test a KNN classifier and a tree classifier on the same data, and then we'll do some analysis to see which one performs better on unseen training examples!
+
+Our first step in building a classifier is figuring out what question we want to answer. In this case, we'd like to know: *If I am pulled over for speeding, will I get a warning or a citation?* The next step is to choose which attributes of our dataset we will use to infer the answer to our question. The classifier will be trained using these attributes, and then we can test its performance on data that was not used to build it. The attributes we'll choose are:
+
+* The month of the stop
+* The day of month of the stop 
+* The hour of day that the stop was made
+* The amount being traveled over the speed limit
+* **Whether a warning or a citation was received** (this is what we want our classifier to answer)
+
+To train a classifier on these attributes, we're going to have to extract relevant information from our original `tv` table. Let's begin!
+
+### Building the training dataset
+
+The only attributes we need that aren't already explicitly encoded in the `tv` table above are the month, day, and hour. We can extract them taking the relevant information from the 'time' and 'date' columns (the [lubridate](https://cran.r-project.org/web/packages/lubridate/vignettes/lubridate.html) library will make this very easy).
+
+```{r buildTrainingTable}
+
+trainTbl <- tv %>%
+  mutate(Month = month(DateOfStop), # Extract month/day/hour
+         Day = day(DateOfStop),
+         Hour = hour(TimeOfStop)) %>%
+  select(Month, # Remove all columns not being used for analysis
+         Day, 
+         Hour, 
+         Diff,
+         ViolationType) %>%
+  na.omit() # Remove any entries with NA values
+
+trainTbl
+```
+
+Above is the table we'll be using to train our classifiers. Classifier training (especially KNN) can be computationally expensive, so we won't be able to use all ~90,000 rows. We'll take a subset of 4,000 rows of data. This should be plenty of data to train on but also a small enough amount of data to let our classifiers finish training in a reasonable amount of time. 
+
+```{r subsetData}
+set.seed(45)
+subsetSize <- 4000
+# Subset data, taking 50% citations and 50% warnings
+warningsTbl <- trainTbl %>% filter(ViolationType == 'Warning') %>% sample_n(subsetSize*0.5)
+citationsTbl <- trainTbl %>% filter(ViolationType == 'Citation') %>% sample_n(subsetSize*0.5)
+
+# Bind the rows of warningsTbl and citationsTbl into a new table
+trainTbl <- rbind(warningsTbl, citationsTbl)
+```
+
+Now that we've subsetted our data, we have to split it into *training* data and *testing* data. This is a very important part of training a classifier. The training data is used to train, or teach, the classifier, and the testing data is used to examine the performance of the classifier on data that it hasn't yet seen. We'll use this notion of training/testing data in combination with a technique called **k-fold cross-validation** (more info [here](https://www.openml.org/a/estimation-procedures/1)). This process allows us to reduce error in our results introduced by the randomness of our sampling. A basic outline of the k-fold cross-validation process is as follows (note that the *k* here is not the same K in K nearest neighbors):
+
+1. Split the data into *k* equal-sized partitions (folds).
+2. For *i* in 1 - k:
+  + Train the classifier on all partitions **except** partition *i*
+  + Test the classifier on partition *i*
+  + Collect **statistics** on the performance of the classifier for this *i* (fold).
+3. Average (or otherwise combine) the statistics for each fold to get an overall statistic. 
+
+What do we mean by **statistics**? When examining the performance of a classifier, it's not usually enough to just calculate error rate. There are four possible ways that a classifier can classify a piece of input ((see [here](http://www.hcbravo.org/IntroDataSci/bookdown-notes/linear-models-for-classification.html#classifier-evaluation) for more info):
+
+* False Positive (incorrectly classified as positive)
+* False Negative (incorrectly classified as negative)
+* True Positive (correctly classified as positive)
+* True Negative (correctly classified as negative)
+
+For any of these classification types, the statistic we would want to examine is how many of those classification types showed up in our testing data classifications, e.g., the False Positive Rate (FPR) is how many examples from the testing data were classified as false positives.
+
+Now that we have our training data and an idea of the information we want from our classifiers, we can begin training. We'll start with KNN. 
+
+### Training a KNN Classifier
+
+A K-nearest-neighbors classifier works by examining how close (similar) input examples are and grouping them into clusters, where every input example within a cluster has the same classification. The *K* is a hyperparameter to the algorithm that specifies how many neighbors (input examples) to consult when determining which cluster an input example should be assigned to. Choosing K is not straightforward; often, the best choice of K can only be found by adjusting it and seeing which value gives the best reuslts. For further explanation, visit [this page](https://kevinzakka.github.io/2016/07/13/k-nearest-neighbor/).
+
+KNN has an interesting property under its hood. When it classifies an example as positive or negative, it's actually calculating a probability that that example is positive. If that probability is greater than a certain cutoff point (by default 0.5), then the example gets classified as positive; if the probability is below 0.5, the example gets classified as negative. We can run the classifier multiple times with different cutoff points and examine how the statistics from above change in response to the cutoff point.
+
+In particular, we can create a [Reciever Operating Characteristic (ROC) curve](http://gim.unmc.edu/dxtests/roc3.htm), which plots TPR against FPR for multiple cutoff points. This curve (and the area under it) can be used to determine the accuracy of our classifier. The farther above y=x the curve is (the greater the area under the curve), the more accurate the classifier is.
+
+We will record error rate for each fold at cutoff = 0.5 (this is the cutoff point that R's `knn` classifier uses). Our error rate will then be the mean of the recorded error rates. We will record the mean of FPR and TPR across folds for each cutoff point, and these will be used to plot the ROC curve. We'll choose 20 for the number of cross-validation folds since we have a lot of data to work with. I have decided to choose k = 7 for this particular KNN classifier. If you want, you can play around with the value of k and see how it affects our results.
+
+```{r doKnn}
+# Set the random seed to a constant value so that our results are consistent across runs
+set.seed(45)
+nFolds <- 20 # Number of folds
+cutoffs <- (0:10) / 10 # 0, 0.1, 0.2, ..., 1
+k <- 7 # Try different values for k and see how it affects your results!
+
+# Create a copy of trainTbl whose rows are randomly ordered.
+# This is necessary for random selection in cross-validation.
+shuf <- trainTbl %>% sample_n(size=nrow(trainTbl)) 
+setSize <- nrow(shuf) / nFolds # Size of a set or partition
+
+# These vectors will hold the FPRs, TPRs, and error rates of our classifier
+knnFprs <- vector()
+knnTprs <- vector()
+knnErrorRates <- vector()
+
+for (cutoff in cutoffs) {
+  
+  # Vectors to hold the tpr/fpr for a particular fold
+  tprsForFold <- vector()
+  fprsForFold <- vector()
+  
+  for (fold in 1:nFolds) {
+
+    # Calculate which portion of the data our testing fold will be
+    foldStart <- (fold-1)*setSize + 1
+    foldEnd <- (fold-1)*setSize + 1 + setSize - 1
+    foldRange <- foldStart:foldEnd
+    
+    # Split the data based on the testing fold range
+    testingData <- shuf %>% slice(foldRange)
+    trainingData <- shuf %>% slice(-foldRange)
+    
+    # Set up input to be used with knn
+    trainInput <- trainingData %>% select(-ViolationType)
+    testInput <- testingData %>% select(-ViolationType)
+    trainTargets <- trainingData$ViolationType
+    testTargets <- testingData$ViolationType
+    
+    # Run knn (see ?knn in the R console for more information)
+    kout <- knn(train=trainInput,
+                test=testInput,
+                cl=trainTargets,
+                k=k,
+                prob=TRUE)
+    classifications <- kout
+    probs <- attr(kout, 'prob')
+    
+    # Convert probabilities for each classification into probability of Citation (positive)
+    # We do this so we can create a custom cutoff point for positive classification
+    customClassifications <- NA
+    for (i in 1:length(classifications)) {
+      probOfCitation <- ifelse(classifications[[i]] == 'Citation', probs[[i]], 1 - probs[[i]])
+      customClassifications[[i]] <- ifelse((probOfCitation < cutoff) | 
+                                             (probOfCitation == 1 & cutoff == 1), 
+                                            'Warning', 
+                                            'Citation')
+    }
+    
+    # Build a confusion matrix of predicted and observed values
+    confMat <- table(predicted=factor(customClassifications, levels=c('Citation', 'Warning')), 
+                     observed=factor(testTargets, levels=c('Citation', 'Warning')))
+    
+    # Number of true positives, true negatives, etc...
+    nTruePos <- confMat['Citation', 'Citation']
+    nTrueNeg <- confMat['Warning', 'Warning']
+    nFalsePos <- confMat['Citation', 'Warning']
+    nFalseNeg <- confMat['Warning', 'Citation']
+    nTotal <- nrow(testInput)
+    
+    # The error rate we collect is for cutoff == 0.5 because this is the cutoff that knn uses by default
+    if (cutoff == 0.5) { knnErrorRates[[fold]] <- 1 - (nTruePos + nTrueNeg)/nTotal }
+    
+    # Record the tpr/fpr for this fold
+    tprsForFold[[fold]] <- nTruePos/(nTruePos + nFalseNeg)
+    fprsForFold[[fold]] <- nFalsePos/(nFalsePos + nTrueNeg)
+  }
+  
+  # Record the average tpr/fpr for this cutoff point
+  knnTprs[cutoff * 10 + 1] <- mean(tprsForFold)
+  knnFprs[cutoff * 10 + 1] <- mean(fprsForFold)
+}
+
+# Calculate final (average) knn error rate and the SD of the recorded error rates
+knnErrorRate <- mean(knnErrorRates)
+knnErrorRateSD <- sd(knnErrorRates)
+
+knnErrorRate
+knnErrorRateSD
+```
+
+We have an error rate of 23.7% and the error's standard deviation over all 20 folds is .034. Not bad! Now let's take a look at the ROC curve (TPR vs. FPR).
+
+```{r plotKnnROC}
+knnRocData <- data.frame(TPR = knnTprs, FPR = knnFprs) %>% 
+  as_tibble
+
+knnRocData %>% 
+  ggplot(mapping=aes(y=TPR, x=FPR)) +
+  labs(y='True Positive Rate',
+       x='False Positive Rate',
+       title='KNN Reciever Operating Characteristic Curve') +
+  geom_point() +
+  geom_line()
+```
+
+The TPR and FPR both increase as the cutoff decreases. Intuitively, the fact that anything above a cutoff gets classified as positive means that a lower cutoff will cause more examples to be classified as positive.
+
+The metric that we want from this curve is the AUROC, or the Area Under the Receiver Operating Characteristic curve. We can calculate this by taking the integral (via trapezoidal Riemann sum) of our points on the graph:
+
+```{r calcAUROC}
+# Sort the ROC data in increasing x order for trapz
+sortedKnnRocData <- arrange(knnRocData, FPR)
+knnAuroc <- trapz(y=sortedKnnRocData$TPR, x=sortedKnnRocData$FPR)
+knnAuroc
+```
+
+According to [this page](http://gim.unmc.edu/dxtests/roc3.htm), an AUROC of 0.84 is considered "good" and gets a grade of B. Our AUROC, combined with an average error rate of 24% across 20 folds, indicates that this classifier is pretty strong. Let's see how a decision tree classifier measures up!
+
+### Training a Decision Tree Classifier 
+
+From an input/output perspective, [decision trees](http://www.hcbravo.org/IntroDataSci/bookdown-notes/tree-based-methods.html#classification-decision-trees) are very similar to KNN classifiers: they take a set of input examples, learn classifications, and produce output classifications on testing data. The difference is in the way the classifications are learned and generated. See the link for info on the algorithm used to build the trees. 
+
+Training the tree will be done in a highly similar manner to the KNN classifier's training; we'll even use the same training table. I have omitted comments in this section (except where the code differs from that of the KNN code) because it is so similar to the code used to train KNN. The classification code makes use of R formulas, which you can read more about [here](http://faculty.chicagobooth.edu/richard.hahn/teaching/formulanotation.pdf).
+
+```{r trainTree}
+set.seed(45)
+nFolds <- 20
+cutoffs <- (0:10) / 10
+
+shuf <- trainTbl %>% sample_n(size=nrow(trainTbl)) 
+setSize <- nrow(shuf) / nFolds
+treeFprs <- vector()
+treeTprs <- vector()
+treeErrorRates <- vector()
+
+for (cutoff in cutoffs) {
+
+  tprsForFold <- vector()
+  fprsForFold <- vector()
+  
+  for (fold in 1:nFolds) {
+    foldStart <- (fold-1)*setSize + 1
+    foldEnd <- (fold-1)*setSize + 1 + setSize - 1
+    foldRange <- foldStart:foldEnd
+    trainingData <- shuf %>% slice(-foldRange)
+    testingData <- shuf %>% slice(foldRange)
+    
+    testInput <- testingData %>% select(-ViolationType)
+    trainTargets <- trainingData$ViolationType
+    testTargets <- testingData$ViolationType
+    # Train this tree to learn ViolationType as an outcome against all other variables in the trainingTbl
+    # (Day, Month, Hour, Diff)
+    tr <- tree(ViolationType~., data=trainingData)
+    
+    # The predict() function returns probabilities instead of classifications,
+    # so we can use these with our cutoff point
+    treePredictions <- predict(tr, newdata=testingData %>% select(-ViolationType)) %>% 
+      as_tibble() %>%
+      mutate(ProbOfCitation=Citation) %>%
+      mutate(Citation=ifelse((ProbOfCitation < cutoff) | (ProbOfCitation == 1 & cutoff == 1), 
+                              'Warning', 
+                              'Citation')) %>%
+      mutate(Citation=factor(Citation, levels=c('Citation', 'Warning')))
+    
+    confMat <- table(predicted=treePredictions$Citation,
+                     observed=factor(testingData$ViolationType, levels=c('Citation', 'Warning')))
+    
+    nTruePos <- confMat['Citation', 'Citation']
+    nTrueNeg <- confMat['Warning', 'Warning']
+    nFalsePos <- confMat['Citation', 'Warning']
+    nFalseNeg <- confMat['Warning', 'Citation']
+    nTotal <- nrow(testInput)
+    
+    if (cutoff == 0.5) { treeErrorRates[[fold]] <- 1 - (nTruePos + nTrueNeg)/nTotal }
+    tprsForFold[[fold]] <- nTruePos/(nTruePos + nFalseNeg)
+    fprsForFold[[fold]] <- nFalsePos/(nFalsePos + nTrueNeg)
+  }
+  treeTprs[cutoff * 10 + 1] <- mean(tprsForFold)
+  treeFprs[cutoff * 10 + 1] <- mean(fprsForFold)
+}
+
+treeErrorRate <- mean(treeErrorRates)
+treeErrorRateSD <- sd(treeErrorRates)
+
+treeErrorRate
+treeErrorRateSD
+```
+
+With an error rate of 21.1%, it looks like our decision tree classifier has just narrowly outperformed our KNN classifier. One neat aspect of a decision tree is that it can be visualized (unlike KNN, at least with the number of input dimensions we have). Here's a visualization:
+
+```{r plotTree}
+plot(tr)
+text(tr)
+```
+
+This plot shows the different values for our input variables that lead to a classification of Warning or Citation.
+
+Now let's take a look at the tree's ROC curve. We'll plot it alongside KNN's ROC curve for comparison. 
+
+```{r plotTreeRoc}
+treeRocData <- data.frame(TPR = treeTprs, FPR = treeFprs) %>% 
+  as_tibble %>%
+  mutate(Classifier = 'Decision Tree')
+
+knnRocData <- knnRocData %>% mutate(Classifier='KNN')
+
+bothRocData <- rbind(treeRocData, knnRocData) %>%
+  mutate(Classifier=factor(Classifier, levels=c('KNN', 'Decision Tree')))
+
+bothRocData %>% 
+  ggplot(mapping=aes(y=TPR, x=FPR, colour=Classifier)) +
+  labs(y='True Positive Rate',
+       x='False Positive Rate',
+       title='KNN vs. Decision Tree ROCs') +
+  geom_point() +
+  geom_line()
+```
+
+The curves appear to be very similar. The decision tree's AUROC is:
+```{r treeAuroc}
+# Sort the ROC data in increasing x order for trapz
+sortedTreeRocData <- arrange(treeRocData, FPR)
+treeAuroc <- trapz(y=sortedTreeRocData$TPR, x=sortedTreeRocData$FPR)
+treeAuroc
+```
+
+The AUROC is .84, which is slightly higher than the KNN classifier's! For comparison, here are the ending statistics for both classifiers:
+
+```{r buildBothStats}
+knnStats <- c('KNN', knnErrorRate, knnErrorRateSD, knnAuroc)
+treeStats <- c('Decision Tree', treeErrorRate, treeErrorRateSD, treeAuroc)
+
+bothStats <- rbind(knnStats, treeStats) %>%
+  as_tibble()
+colnames(bothStats) <- c('Classifier', 'AverageErrorRate', 'ErrorRateSD', 'AUROC')
+bothStats
+```
+
+The statistics match up quite closely, with the tree's error rate and AUROC being slightly better than those of the KNN classifier. But let's perform one final piece of analysis regarding the error rates: A hypothesis test to determine whether or not the error rate distributions are significantly different. 
+
+### Hypothesis Test: Does the tree classifier have a significantly lower error rate than the KNN classifier?
+
+We want to test for a significant difference in the distribution of error rates across folds for each classifier. We can plot the distributions side by side to get a visual idea first:
+
+```{r plotDistrs}
+knnCols <- data.frame(Classifier='KNN', ErrorRate=knnErrorRates)
+treeCols <- data.frame(Classifier='Decision Tree', ErrorRate=treeErrorRates)
+distsTbl <- rbind(knnCols, treeCols) %>% as_tibble()
+
+distsTbl %>% 
+  ggplot(aes(y=ErrorRate, x=Classifier)) +
+    geom_boxplot() +
+    geom_point() +
+    labs(x='Classifier',
+         y='Error Rate',
+         title='Classifier Error Rates')
+```
+
+The distributions appear to indicate that KNN does in fact have a higher error rate distribution. The two plots have similar spreads (IQRs), but KNN's distribution has a higher median (center). We'll need a statistical test to confirm. Let's run another [t-test](http://www.statisticshowto.com/probability-and-statistics/t-test/). Our null hypothesis will be that there is no significant difference in the distributions of the error rates between classifiers. To run this t-test, we'll run a regression model of `ErrorRate` against `Classifier` using the two distribusions.
+
+```{r ttest}
+model <- lm(ErrorRate~Classifier, data=distsTbl)
+summary(model)
+```
+
+The summary tells us that the error rate for the tree appears to be, on average, about 2.5% lower than the error rate for the KNN classifier. With a p-value of .02 (< .05), We can reject our null hypothesis that neither is significantly better than the other. These results are statistically significant! Thus, we can draw the conclusion that **the tree classifier outperforms the KNN classifier on this dataset.**
+
+Now that we have our training models, we can use them to predict the probability of getting a citation vs. a violation based on the hour, day, month, and amount over the speed limit we're driving. Keep in mind that machine learning is not a one-size-fits-all tool; our classifiers worked well on this data, but there are datasets and attribute sets that KNN and decision trees may not work so well on.
+
+There are also other types of machine learning as well, most notably [neural networks](https://ujjwalkarn.me/2016/08/09/quick-intro-neural-networks/). I encourage you could try training the data from this tutorial on a neural network (or another machine learning tool of your choice) and see how that compares to our tree and KNN classifier! 
